@@ -29,55 +29,37 @@
    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-#ifdef HAVE_CONFIG_H
-# include "config.h"
-#endif
+
 
 #include <stdio.h>
-#if !defined WIN32 && !defined _WIN32
 #include <unistd.h>
-#endif
-#ifdef HAVE_GETOPT_H
-#include <getopt.h>
-#endif
-#ifndef HAVE_GETOPT_LONG
+
+
 #include "getopt_win.h"
-#endif
+
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 #include "speex/speex.h"
 #include "speex/speex_header.h"
-#include "speex/speex_stereo.h"
-#include <ogg/ogg.h>
-#include "wav_io.h"
-#ifdef USE_SPEEXDSP
-#include <speex/speex_preprocess.h>
-#endif
 
-#if defined WIN32 || defined _WIN32
-/* We need the following two to set stdout to binary */
-#include <io.h>
-#include <fcntl.h>
-#endif
 
-#include "skeleton.h"
+
+
+#if !defined(__LITTLE_ENDIAN__) && ( defined(WORDS_BIGENDIAN) || defined(__BIG_ENDIAN__) )
+#define le_short(s) ((short) ((unsigned short) (s) << 8) | ((unsigned short) (s) >> 8))
+#define be_short(s) ((short) (s))
+#else
+#define le_short(s) ((short) (s))
+#define be_short(s) ((short) ((unsigned short) (s) << 8) | ((unsigned short) (s) >> 8))
+#endif
 
 
 void comment_init(char **comments, int* length, char *vendor_string);
 void comment_add(char **comments, int* length, char *tag, char *val);
 
 
-/*Write an Ogg page to a file pointer*/
-int oe_write_page(ogg_page *page, FILE *fp)
-{
-   int written;
-   written = fwrite(page->header,1,page->header_len, fp);
-   written += fwrite(page->body,1,page->body_len, fp);
-
-   return written;
-}
 
 #define MAX_FRAME_SIZE 2000
 #define MAX_FRAME_BYTES 2000
@@ -161,43 +143,9 @@ static int read_samples(FILE *fin,int frame_size, int bits, int channels, int ls
       input[i]=0;
    }
 
-
    return nb_read;
 }
 
-void add_fishead_packet (ogg_stream_state *os) {
-
-   fishead_packet fp;
-
-   memset(&fp, 0, sizeof(fp));
-   fp.ptime_n = 0;
-   fp.ptime_d = 1000;
-   fp.btime_n = 0;
-   fp.btime_d = 1000;
-
-   add_fishead_to_stream(os, &fp);
-}
-
-/*
- * Adds the fishead packets in the skeleton output stream along with the e_o_s packet
- */
-void add_fisbone_packet (ogg_stream_state *os, spx_int32_t serialno, SpeexHeader *header) {
-
-   fisbone_packet fp;
-
-   memset(&fp, 0, sizeof(fp));
-   fp.serial_no = serialno;
-   fp.nr_header_packet = 2 + header->extra_headers;
-   fp.granule_rate_n = header->rate;
-   fp.granule_rate_d = 1;
-   fp.start_granule = 0;
-   fp.preroll = 3;
-   fp.granule_shift = 0;
-
-   add_message_header_field(&fp, "Content-Type", "audio/x-speex");
-
-   add_fisbone_to_stream(os, &fp);
-}
 
 void version()
 {
@@ -243,10 +191,6 @@ void usage()
    printf (" --dtx              Enable file-based discontinuous transmission (DTX)\n");
    printf (" --comp n           Set encoding complexity (0-10), default 3\n");
    printf (" --nframes n        Number of frames per Ogg packet (1-10), default 1\n");
-#ifdef USE_SPEEXDSP
-   printf (" --denoise          Denoise the input before encoding\n");
-   printf (" --agc              Apply adaptive gain control (AGC) before encoding\n");
-#endif
    printf (" --no-highpass      Disable the encoder's built-in high-pass filter\n");
    printf (" --skeleton         Outputs ogg skeleton metadata (may cause incompatibilities)\n");
    printf (" --comment          Add the given string as an extra comment. This may be\n");
@@ -271,9 +215,12 @@ void usage()
    printf ("Please report bugs to the mailing list `speex-dev@xiph.org'.\n");
 }
 
+#include <time.h>
 
 int main(int argc, char **argv)
 {
+   clock_t start, end;
+   double cpu_time_use;
    int nb_samples, total_samples=0, nb_encoded;
    int c;
    int option_index = 0;
@@ -338,10 +285,6 @@ int main(int argc, char **argv)
    spx_int32_t quality=-1;
    float vbr_quality=-1;
    int lsb=1;
-   ogg_stream_state os;
-   ogg_stream_state so; /* ogg stream for skeleton bitstream */
-   ogg_page og;
-   ogg_packet op;
    int bytes_written=0, ret, result;
    int id=-1;
    SpeexHeader header;
@@ -349,14 +292,14 @@ int main(int argc, char **argv)
    spx_int32_t complexity=3;
    const char* speex_version;
    char vendor_string[64];
-   char *comments;
+   // char *comments;
    int comments_length;
    int close_in=0, close_out=0;
    int eos=0;
    spx_int32_t bitrate=0;
    double cumul_bits=0, enc_frames=0;
    char first_bytes[12];
-   int wave_input=0;
+
    spx_int32_t tmp;
 #ifdef USE_SPEEXDSP
    SpeexPreprocessState *preprocess = NULL;
@@ -369,7 +312,7 @@ int main(int argc, char **argv)
    speex_lib_ctl(SPEEX_LIB_GET_VERSION_STRING, (void*)&speex_version);
    snprintf(vendor_string, sizeof(vendor_string), "Encoded with Speex %s", speex_version);
 
-   comment_init(&comments, &comments_length, vendor_string);
+   // comment_init(&comments, &comments_length, vendor_string);
 
    /*Process command-line options*/
    while(1)
@@ -491,13 +434,13 @@ int main(int argc, char **argv)
                fprintf (stderr, "Comments must be of the form name=value\n");
                exit(1);
             }
-           comment_add(&comments, &comments_length, NULL, optarg);
+         //   comment_add(&comments, &comments_length, NULL, optarg);
          } else if (strcmp(long_options[option_index].name,"author")==0)
          {
-           comment_add(&comments, &comments_length, "author=", optarg);
+         //   comment_add(&comments, &comments_length, "author=", optarg);
          } else if (strcmp(long_options[option_index].name,"title")==0)
          {
-           comment_add(&comments, &comments_length, "title=", optarg);
+         //   comment_add(&comments, &comments_length, "title=", optarg);
          }
 
          break;
@@ -535,29 +478,10 @@ int main(int argc, char **argv)
    inFile=argv[optind];
    outFile=argv[optind+1];
 
-   /*Initialize Ogg stream struct*/
-   srand(time(NULL));
-   if (ogg_stream_init(&os, rand())==-1)
-   {
-      fprintf(stderr,"Error: stream init failed\n");
-      exit(1);
-   }
-   if (with_skeleton && ogg_stream_init(&so, rand())==-1)
-   {
-      fprintf(stderr,"Error: stream init failed\n");
-      exit(1);
-   }
 
-   if (strcmp(inFile, "-")==0)
-   {
-#if defined WIN32 || defined _WIN32
-         _setmode(_fileno(stdin), _O_BINARY);
-#elif defined OS2
-         _fsetmode(stdin,"b");
-#endif
-      fin=stdin;
-   }
-   else
+  start = clock();
+
+
    {
       fin = fopen(inFile, "rb");
       if (!fin)
@@ -574,69 +498,10 @@ int main(int argc, char **argv)
          perror("short file");
          exit(1);
       }
-      if (strncmp(first_bytes,"RIFF",4)==0 || strncmp(first_bytes,"riff",4)==0)
-      {
-         if (read_wav_header(fin, &rate, &chan, &fmt, &size)==-1)
-            exit(1);
-         wave_input=1;
-         lsb=1; /* CHECK: exists big-endian .wav ?? */
-      }
+
    }
 
-   if (modeID==-1 && !rate)
-   {
-      /* By default, use narrowband/8 kHz */
-      modeID = SPEEX_MODEID_NB;
-      rate=8000;
-   } else if (modeID!=-1 && rate)
-   {
-      mode = speex_lib_get_mode (modeID);
-      if (rate>48000)
-      {
-         fprintf (stderr, "Error: sampling rate too high: %d Hz, try down-sampling\n", rate);
-         exit(1);
-      } else if (rate>25000)
-      {
-         if (modeID != SPEEX_MODEID_UWB)
-         {
-            fprintf (stderr, "Warning: Trying to encode in %s at %d Hz. I'll do it but I suggest you try ultra-wideband instead\n", mode->modeName , rate);
-         }
-      } else if (rate>12500)
-      {
-         if (modeID != SPEEX_MODEID_WB)
-         {
-            fprintf (stderr, "Warning: Trying to encode in %s at %d Hz. I'll do it but I suggest you try wideband instead\n", mode->modeName , rate);
-         }
-      } else if (rate>=6000)
-      {
-         if (modeID != SPEEX_MODEID_NB)
-         {
-            fprintf (stderr, "Warning: Trying to encode in %s at %d Hz. I'll do it but I suggest you try narrowband instead\n", mode->modeName , rate);
-         }
-      } else {
-         fprintf (stderr, "Error: sampling rate too low: %d Hz\n", rate);
-         exit(1);
-      }
-   } else if (modeID==-1)
-   {
-      if (rate>48000)
-      {
-         fprintf (stderr, "Error: sampling rate too high: %d Hz, try down-sampling\n", rate);
-         exit(1);
-      } else if (rate>25000)
-      {
-         modeID = SPEEX_MODEID_UWB;
-      } else if (rate>12500)
-      {
-         modeID = SPEEX_MODEID_WB;
-      } else if (rate>=6000)
-      {
-         modeID = SPEEX_MODEID_NB;
-      } else {
-         fprintf (stderr, "Error: Sampling rate too low: %d Hz\n", rate);
-         exit(1);
-      }
-   } else if (!rate)
+   
    {
       if (modeID == SPEEX_MODEID_NB)
          rate=8000;
@@ -669,17 +534,11 @@ int main(int argc, char **argv)
    /*fprintf (stderr, "Encoding %d Hz audio at %d bps using %s mode\n",
      header.rate, mode->bitrate, mode->modeName);*/
 
+   start = clock();
    /*Initialize Speex encoder*/
    st = speex_encoder_init(mode);
 
-   if (strcmp(outFile,"-")==0)
-   {
-#if defined WIN32 || defined _WIN32
-      _setmode(_fileno(stdout), _O_BINARY);
-#endif
-      fout=stdout;
-   }
-   else
+
    {
       fout = fopen(outFile, "wb");
       if (!fout)
@@ -689,6 +548,8 @@ int main(int argc, char **argv)
       }
       close_out=1;
    }
+
+
 
    speex_encoder_ctl(st, SPEEX_GET_FRAME_SIZE, &frame_size);
    speex_encoder_ctl(st, SPEEX_SET_COMPLEXITY, &complexity);
@@ -729,9 +590,7 @@ int main(int argc, char **argv)
    {
       fprintf (stderr, "Warning: --vad is already implied by --vbr or --abr\n");
    }
-   if (with_skeleton) {
-      fprintf (stderr, "Warning: Enabling skeleton output may cause some decoders to fail.\n");
-   }
+ 
 
    if (abr_enabled)
    {
@@ -742,121 +601,28 @@ int main(int argc, char **argv)
 
    speex_encoder_ctl(st, SPEEX_GET_LOOKAHEAD, &lookahead);
 
-#ifdef USE_SPEEXDSP
-   if (denoise_enabled || agc_enabled)
-   {
-      preprocess = speex_preprocess_state_init(frame_size, rate);
-      speex_preprocess_ctl(preprocess, SPEEX_PREPROCESS_SET_DENOISE, &denoise_enabled);
-      speex_preprocess_ctl(preprocess, SPEEX_PREPROCESS_SET_AGC, &agc_enabled);
-      lookahead += frame_size;
-   }
-#endif
-   /* first packet should be the skeleton header. */
 
-   if (with_skeleton) {
-      add_fishead_packet(&so);
-      if ((ret = flush_ogg_stream_to_file(&so, fout))) {
-         fprintf (stderr,"Error: failed skeleton (fishead) header to output stream\n");
-         exit(1);
-      } else
-         bytes_written += ret;
-   }
-
-   /*Write header*/
-   {
-      int packet_size;
-      op.packet = (unsigned char *)speex_header_to_packet(&header, &packet_size);
-      op.bytes = packet_size;
-      op.b_o_s = 1;
-      op.e_o_s = 0;
-      op.granulepos = 0;
-      op.packetno = 0;
-      ogg_stream_packetin(&os, &op);
-      free(op.packet);
-
-      while((result = ogg_stream_flush(&os, &og)))
-      {
-         if(!result) break;
-         ret = oe_write_page(&og, fout);
-         if(ret != og.header_len + og.body_len)
-         {
-            fprintf (stderr,"Error: failed writing header to output stream\n");
-            exit(1);
-         }
-         else
-            bytes_written += ret;
-      }
-
-      op.packet = (unsigned char *)comments;
-      op.bytes = comments_length;
-      op.b_o_s = 0;
-      op.e_o_s = 0;
-      op.granulepos = 0;
-      op.packetno = 1;
-      ogg_stream_packetin(&os, &op);
-   }
-
-   /* fisbone packet should be write after all bos pages */
-   if (with_skeleton) {
-      add_fisbone_packet(&so, os.serialno, &header);
-      if ((ret = flush_ogg_stream_to_file(&so, fout))) {
-         fprintf (stderr,"Error: failed writing skeleton (fisbone )header to output stream\n");
-         exit(1);
-      } else
-         bytes_written += ret;
-   }
-
-   /* writing the rest of the speex header packets */
-   while((result = ogg_stream_flush(&os, &og)))
-   {
-      if(!result) break;
-      ret = oe_write_page(&og, fout);
-      if(ret != og.header_len + og.body_len)
-      {
-         fprintf (stderr,"Error: failed writing header to output stream\n");
-         exit(1);
-      }
-      else
-         bytes_written += ret;
-   }
-
-   free(comments);
-
-   /* write the skeleton eos packet */
-   if (with_skeleton) {
-      add_eos_packet_to_stream(&so);
-      if ((ret = flush_ogg_stream_to_file(&so, fout))) {
-         fprintf (stderr,"Error: failed writing skeleton header to output stream\n");
-         exit(1);
-      } else
-         bytes_written += ret;
-   }
 
 
    speex_bits_init(&bits);
-
-   if (!wave_input)
-   {
-      nb_samples = read_samples(fin,frame_size,fmt,chan,lsb,input, first_bytes, NULL);
-   } else {
-      nb_samples = read_samples(fin,frame_size,fmt,chan,lsb,input, NULL, &size);
-   }
+   printf("frame_size: %d,fmt: %d,chan: %d,lsb: %d,lookahead: %d\n", frame_size,fmt,chan,lsb, lookahead);
+  
+   
+   
+   nb_samples = read_samples(fin,frame_size,fmt,chan,lsb,input, first_bytes, NULL);
+   
    if (nb_samples==0)
       eos=1;
    total_samples += nb_samples;
    nb_encoded = -lookahead;
+  
    /*Main encoding loop (one frame per iteration)*/
    while (!eos || total_samples>nb_encoded)
    {
       id++;
       /*Encode current frame*/
-      if (chan==2)
-         speex_encode_stereo_int(input, frame_size, &bits);
+   
 
-#ifdef USE_SPEEXDSP
-      if (preprocess)
-         speex_preprocess(preprocess, input, NULL);
-#endif
       speex_encode_int(st, input, &bits);
 
       nb_encoded += frame_size;
@@ -879,166 +645,39 @@ int main(int argc, char **argv)
 
       }
 
-      if (wave_input)
       {
-         nb_samples = read_samples(fin,frame_size,fmt,chan,lsb,input, NULL, &size);
-      } else {
          nb_samples = read_samples(fin,frame_size,fmt,chan,lsb,input, NULL, NULL);
       }
       if (nb_samples==0)
       {
          eos=1;
       }
-      if (eos && total_samples<=nb_encoded)
-         op.e_o_s = 1;
-      else
-         op.e_o_s = 0;
+
       total_samples += nb_samples;
 
       if ((id+1)%nframes!=0)
          continue;
       speex_bits_insert_terminator(&bits);
       nbBytes = speex_bits_write(&bits, cbits, MAX_FRAME_BYTES);
+      fwrite(cbits, 1, nbBytes, fout);
       speex_bits_reset(&bits);
-      op.packet = (unsigned char *)cbits;
-      op.bytes = nbBytes;
-      op.b_o_s = 0;
-      /*Is this redundent?*/
-      if (eos && total_samples<=nb_encoded)
-         op.e_o_s = 1;
-      else
-         op.e_o_s = 0;
-      op.granulepos = (id+1)*frame_size-lookahead;
-      if (op.granulepos>total_samples)
-         op.granulepos = total_samples;
-      /*printf ("granulepos: %d %d %d %d %d %d\n", (int)op.granulepos, id, nframes, lookahead, 5, 6);*/
-      op.packetno = 2+id/nframes;
-      ogg_stream_packetin(&os, &op);
-
-      /*Write all new pages (most likely 0 or 1)*/
-      while (ogg_stream_pageout(&os,&og))
-      {
-         ret = oe_write_page(&og, fout);
-         if(ret != og.header_len + og.body_len)
-         {
-            fprintf (stderr,"Error: failed writing header to output stream\n");
-            exit(1);
-         }
-         else
-            bytes_written += ret;
-      }
+      
    }
-   if ((id+1)%nframes!=0)
-   {
-      while ((id+1)%nframes!=0)
-      {
-         id++;
-         speex_bits_pack(&bits, 15, 5);
-      }
-      nbBytes = speex_bits_write(&bits, cbits, MAX_FRAME_BYTES);
-      op.packet = (unsigned char *)cbits;
-      op.bytes = nbBytes;
-      op.b_o_s = 0;
-      op.e_o_s = 1;
-      op.granulepos = (id+1)*frame_size-lookahead;
-      if (op.granulepos>total_samples)
-         op.granulepos = total_samples;
-
-      op.packetno = 2+id/nframes;
-      ogg_stream_packetin(&os, &op);
-   }
-   /*Flush all pages left to be written*/
-   while (ogg_stream_flush(&os, &og))
-   {
-      ret = oe_write_page(&og, fout);
-      if(ret != og.header_len + og.body_len)
-      {
-         fprintf (stderr,"Error: failed writing header to output stream\n");
-         exit(1);
-      }
-      else
-         bytes_written += ret;
-   }
+   
 
    speex_encoder_destroy(st);
    speex_bits_destroy(&bits);
-   ogg_stream_clear(&os);
 
    if (close_in)
       fclose(fin);
    if (close_out)
       fclose(fout);
+
+
+   end = clock();
+   cpu_time_use = ( (double) end-start) / CLOCKS_PER_SEC;
+   printf("took %f seconds to execute \n", cpu_time_use);
+
    return 0;
 }
 
-/*
- Comments will be stored in the Vorbis style.
- It is describled in the "Structure" section of
-    http://www.xiph.org/ogg/vorbis/doc/v-comment.html
-
-The comment header is decoded as follows:
-  1) [vendor_length] = read an unsigned integer of 32 bits
-  2) [vendor_string] = read a UTF-8 vector as [vendor_length] octets
-  3) [user_comment_list_length] = read an unsigned integer of 32 bits
-  4) iterate [user_comment_list_length] times {
-     5) [length] = read an unsigned integer of 32 bits
-     6) this iteration's user comment = read a UTF-8 vector as [length] octets
-     }
-  7) [framing_bit] = read a single bit as boolean
-  8) if ( [framing_bit]  unset or end of packet ) then ERROR
-  9) done.
-
-  If you have troubles, please write to ymnk@jcraft.com.
- */
-
-#define readint(buf, base) (((buf[base+3]<<24)&0xff000000)| \
-                           ((buf[base+2]<<16)&0xff0000)| \
-                           ((buf[base+1]<<8)&0xff00)| \
-                            (buf[base]&0xff))
-#define writeint(buf, base, val) do{ buf[base+3]=((val)>>24)&0xff; \
-                                     buf[base+2]=((val)>>16)&0xff; \
-                                     buf[base+1]=((val)>>8)&0xff; \
-                                     buf[base]=(val)&0xff; \
-                                 }while(0)
-
-void comment_init(char **comments, int* length, char *vendor_string)
-{
-  int vendor_length=strlen(vendor_string);
-  int user_comment_list_length=0;
-  int len=4+vendor_length+4;
-  char *p=(char*)malloc(len);
-  if(p==NULL){
-     fprintf (stderr, "malloc failed in comment_init()\n");
-     exit(1);
-  }
-  writeint(p, 0, vendor_length);
-  memcpy(p+4, vendor_string, vendor_length);
-  writeint(p, 4+vendor_length, user_comment_list_length);
-  *length=len;
-  *comments=p;
-}
-void comment_add(char **comments, int* length, char *tag, char *val)
-{
-  char* p=*comments;
-  int vendor_length=readint(p, 0);
-  int user_comment_list_length=readint(p, 4+vendor_length);
-  int tag_len=(tag?strlen(tag):0);
-  int val_len=strlen(val);
-  int len=(*length)+4+tag_len+val_len;
-
-  p=(char*)realloc(p, len);
-  if(p==NULL){
-     fprintf (stderr, "realloc failed in comment_add()\n");
-     exit(1);
-  }
-
-  writeint(p, *length, tag_len+val_len);      /* length of comment */
-  if(tag) memcpy(p+*length+4, tag, tag_len);  /* comment */
-  memcpy(p+*length+4+tag_len, val, val_len);  /* comment */
-  writeint(p, 4+vendor_length, user_comment_list_length+1);
-
-  *comments=p;
-  *length=len;
-}
-#undef readint
-#undef writeint
